@@ -6,17 +6,18 @@ import (
 )
 
 type Writer struct {
-	bucket *gocb.Bucket
-	item   Item
-	buffer []byte
+	bucket  *gocb.Bucket
+	item    Item
+	buffer  []byte
+	catalog *Catalog
 }
 
 func MakeWriter(bucket *gocb.Bucket, path string) Writer {
-	return Writer{bucket: bucket, item: makeItem(path)}
+	c := makeCatalog()
+	return Writer{bucket: bucket, item: makeItem(&c, path), catalog: &c}
 }
 
 func (w *Writer) Write(p []byte) (n int, err error) {
-	log.Debug("write length=", len(p))
 	if w.buffer == nil {
 		w.buffer = make([]byte, 0, chunkDefaultSize)
 	}
@@ -45,29 +46,34 @@ func (w *Writer) Close() error {
 	if err != nil {
 		return err
 	}
+	h := makeHouseKeeper(w.bucket, w.catalog)
+	err = h.do()
+	if err != nil {
+		return err
+	}
 	log.Debug("writer closed")
 	return nil
 }
 
 func (w *Writer) updateCatalog() error {
-	c := &Catalog{}
-	cas, err := w.bucket.GetAndLock("cbfs-catalog", 10, c)
+	cas, err := w.bucket.GetAndLock("cbfs-catalog", 10, w.catalog)
 	if err == gocb.ErrKeyNotFound {
 		w.bucket.Insert("cbfs-catalog", nil, 0) // create an empty catalog
-		cas, err = w.bucket.GetAndLock("cbfs-catalog", 10, c)
+		cas, err = w.bucket.GetAndLock("cbfs-catalog", 10, w.catalog)
 	}
 	if err != nil {
 		log.Error("cannot retrieve catalog ", err)
 		return err
 	}
-	c.rebuildCatalog()
-	c.addNewItem(&w.item)
-	_, err = w.bucket.Replace("cbfs-catalog", c, cas, 0)
+	w.catalog.rebuildCatalog() // we need to first rebuild to initialize internal data structures
+	w.catalog.addNewItem(&w.item)
+	w.catalog.rebuildCatalog() // and then once again to purge old versions
+	_, err = w.bucket.Replace("cbfs-catalog", w.catalog, cas, 0)
 	if err != nil {
 		log.Error("cannot replace catalog ", err)
 		return err
 	}
-	log.Debug("updated catalog ", c)
+	log.Debug("updated catalog ", w.catalog)
 	return nil
 }
 

@@ -1,6 +1,8 @@
 package cbbigfile
 
 import (
+	"errors"
+	"fmt"
 	"io"
 
 	log "github.com/sirupsen/logrus"
@@ -8,11 +10,10 @@ import (
 )
 
 type Reader struct {
-	bucket            *gocb.Bucket
-	path              string
-	item              *Item
-	currentChunkIndex uint
-	buffer            []byte
+	bucket *gocb.Bucket
+	path   string
+	item   *Item
+	buffer []byte
 }
 
 func MakeReader(bucket *gocb.Bucket, path string) Reader {
@@ -20,9 +21,8 @@ func MakeReader(bucket *gocb.Bucket, path string) Reader {
 }
 
 func (r *Reader) Read(p []byte) (n int, err error) {
-	log.Debug("read length=", len(p))
 	if r.item == nil {
-		var c Catalog
+		c := makeCatalog()
 		_, err := r.bucket.Get("cbfs-catalog", &c)
 		if err != nil {
 			log.Error("unable to retrieve catalog", err)
@@ -36,22 +36,21 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		r.item = i
 	}
 	for r.buffer == nil || len(p) > len(r.buffer) { // not enough stuff -> load next chunk
-		if r.currentChunkIndex >= uint(len(r.item.Chunks)) { // no more chunk
-			log.Debug("reached EOF buffer=", len(r.buffer))
+		chunk := r.item.nextChunk()
+		if chunk == nil { // no more chunks
+			log.Debug("reached EOF remaining buffer=", len(r.buffer))
 			bc := copy(p, r.buffer) // copy what we have left
-			log.Debug("copied bytes=", bc)
-			return bc, io.EOF // signal we are done
+			return bc, io.EOF       // signal we are done
 		}
-		chunk := r.item.Chunks[r.currentChunkIndex]
-		log.Debug("retrieve chunk ", chunk)
+		log.Debug("next chunk ", chunk)
 		var chunkdata []byte
 		_, err := r.bucket.Get("cbfs-chunk-"+chunk.Checksum, &chunkdata)
 		if err != nil {
 			log.Error("unable to read chunk", err)
 			return 0, err
 		}
-		r.currentChunkIndex++
 		r.buffer = append(r.buffer, chunkdata...)
+		r.item.checksumChunk(chunkdata)
 	}
 
 	bc := copy(p, r.buffer)
@@ -59,6 +58,12 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	return bc, nil
 }
 
-func (w *Reader) Close() error {
+func (r *Reader) Close() error {
+	actualChecksum := fmt.Sprintf("%x", r.item.hash.Sum(nil))
+	if r.item.Checksum != actualChecksum {
+		log.Error("invalid item checksum desired=", r.item.Checksum, " got=", actualChecksum)
+		return errors.New("invalid item checksum")
+	}
+	log.Info("verified item checksum=", r.item.Checksum)
 	return nil
 }
